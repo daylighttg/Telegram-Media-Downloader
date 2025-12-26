@@ -74,10 +74,87 @@
     STORAGE_KEY: "tel_bulk_download_state",
     STATE_EXPIRY_MS: 24 * 60 * 60 * 1000, // 24 hours
     AUTO_LOAD_THRESHOLD: 0.8, // Load when 80% visible
-    SEQUENTIAL_DOWNLOAD_DELAY: 2000 // Delay between auto-downloads (2s to avoid browser blocking)
+    SEQUENTIAL_DOWNLOAD_DELAY: 2000, // Delay between auto-downloads (2s to avoid browser blocking)
+    OBSERVER_TIMEOUT_MS: 20000, // 20s timeout for MutationObserver
+    USE_MUTATION_OBSERVER: true // Feature flag: set to false to disable observer and use broader fallback
   };
 
   const REFRESH_DELAY = CONFIG.REFRESH_DELAY;
+
+  // ===== VARIANT DETECTION & CENTRALIZED SELECTORS =====
+  // FIX: Previously the bulk download button only appeared after opening a video.
+  // This was because chat container detection was too narrow and DOM wasn't fully
+  // loaded on SPA navigation. We now use broader selectors per variant and a
+  // short-lived MutationObserver to detect when the chat container appears.
+
+  const detectVariant = () => {
+    const path = window.location.pathname;
+    if (path.startsWith("/k/")) return "webk";
+    if (path.startsWith("/a/")) return "webz";
+    return "web";
+  };
+
+  // Centralized selector configuration keyed by variant
+  // Shared base selectors + variant-specific overrides
+  const SELECTORS = {
+    shared: {
+      chatContainer: [
+        "#column-center",
+        "#column-center .scrollable-y",
+        ".chat-container",
+        ".messages-container",
+        "#bubbles-inner",
+        ".bubbles-inner",
+        ".bubbles",
+        "[class*='chat']",
+        "[class*='messages']"
+      ],
+      scrollContainer: [
+        "#column-center .scrollable-y",
+        ".bubbles-inner",
+        "#bubbles-inner",
+        ".messages-container"
+      ]
+    },
+    web: {
+      chatContainer: ["#column-center", ".chat-container", ".messages-container", "#bubbles-inner"]
+    },
+    webz: {
+      chatContainer: ["#column-center", ".MiddleColumn", "[data-testid='messages-list']", ".Message"]
+    },
+    webk: {
+      chatContainer: ["#column-center", "#column-center .scrollable-y", ".bubbles-inner", "#bubbles-inner"]
+    },
+    fallback: {
+      chatContainer: ["video", "img", ".bubble", ".Message", "#column-center", "body"]
+    }
+  };
+
+  const getSelectors = (type) => {
+    const variant = detectVariant();
+    const variantSelectors = SELECTORS[variant]?.[type] || [];
+    const sharedSelectors = SELECTORS.shared[type] || [];
+    const combined = [...new Set([...variantSelectors, ...sharedSelectors])];
+    return combined.length > 0 ? combined : (SELECTORS.fallback[type] || []);
+  };
+
+  const findElementBySelectors = (selectors) => {
+    for (const selector of selectors) {
+      try {
+        const matches = document.querySelectorAll(selector);
+        for (const match of matches) {
+          if (match.closest && match.closest('#tel-bulk-sidebar')) continue;
+          return match;
+        }
+      } catch (e) {
+        logger.warn(`Invalid selector skipped: ${selector}`);
+      }
+    }
+    return null;
+  };
+
+  let observerFailed = false;
+  let bulkButtonObserverInitialized = false;
 
   // ===== PERSISTENT DOWNLOAD HISTORY (SURVIVES PAGE REFRESH) =====
   const STORAGE_KEY = 'telegram_downloaded_files';
@@ -2297,6 +2374,9 @@
         // Wait for player to close
         await new Promise(r => setTimeout(r, 300));
 
+        // Re-show bulk download button if it was hidden during video open/close
+        addBulkDownloadButton();
+
         if (videoUrl) {
           logger.info(`✅ Successfully loaded URL by opening player`);
         } else {
@@ -2625,23 +2705,25 @@
     logger.info(`Sidebar opened with ${count} media items`);
   };
 
-  // IMPROVED: Floating button
+  // IMPROVED: Floating button with robust chat detection
+  // FIX: Uses centralized selectors and fallback to ensure button appears without opening video first
   const addBulkDownloadButton = () => {
     if (document.getElementById("tel-bulk-download-floating")) {
       return;
     }
 
-    const isInChat = document.querySelector("#column-center") ||
-                     document.querySelector(".chat-container") ||
-                     document.querySelector(".MiddleColumn") ||
-                     document.querySelector("#bubbles-inner") ||
-                     document.querySelector(".messages-container");
+    // Use centralized selectors; fall back to broader selectors if observer failed
+    const selectors = observerFailed
+      ? SELECTORS.fallback.chatContainer
+      : getSelectors('chatContainer');
+
+    const isInChat = findElementBySelectors(selectors);
 
     if (!isInChat) {
       return;
     }
 
-    logger.info("Chat view detected! Adding bulk download button");
+    logger.info(`Chat view detected (variant: ${detectVariant()})! Adding bulk download button`);
 
     const floatingButton = document.createElement("button");
     floatingButton.id = "tel-bulk-download-floating";
@@ -2658,7 +2740,7 @@
       position: fixed;
       top: ${CONFIG.BUTTON_TOP_POSITION};
       right: ${CONFIG.BUTTON_RIGHT_POSITION};
-      z-index: 9998;
+      z-index: 99998;
       background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
       color: white;
       border: none;
@@ -2689,7 +2771,129 @@
     logger.info("Floating bulk download button added");
   };
 
+  // ===== MUTATION OBSERVER FOR SPA NAVIGATION =====
+  // Short-lived observer that watches for chat container and initializes bulk button
+  // Disconnects after success or 20s timeout to avoid CPU overhead
+
+  const initBulkButtonObserver = () => {
+    // Skip if already initialized or button exists
+    if (bulkButtonObserverInitialized || document.getElementById("tel-bulk-download-floating")) {
+      return;
+    }
+
+    // Skip if feature flag disabled
+    if (!CONFIG.USE_MUTATION_OBSERVER) {
+      logger.info("MutationObserver disabled by feature flag, using interval fallback");
+      return;
+    }
+
+    bulkButtonObserverInitialized = true;
+    logger.info("Initializing MutationObserver for chat container detection...");
+
+    let observer = null;
+    let timeoutId = null;
+    let debounceId = null;
+
+    const cleanup = (reason) => {
+      if (observer) {
+        observer.disconnect();
+        observer = null;
+      }
+      if (timeoutId) {
+        clearTimeout(timeoutId);
+        timeoutId = null;
+      }
+      if (debounceId) {
+        clearTimeout(debounceId);
+        debounceId = null;
+      }
+      logger.info(`MutationObserver cleanup: ${reason}`);
+    };
+
+    const checkAndCreate = () => {
+      // Clear any pending debounce
+      if (debounceId) {
+        clearTimeout(debounceId);
+      }
+
+      // Debounce DOM queries to avoid CPU spikes
+      debounceId = setTimeout(() => {
+        const selectors = getSelectors('chatContainer');
+        const chatContainer = findElementBySelectors(selectors);
+
+        if (chatContainer) {
+          logger.info("Chat container detected by observer, creating button...");
+          addBulkDownloadButton();
+
+          if (document.getElementById("tel-bulk-download-floating")) {
+            cleanup("success - button created");
+          }
+        }
+      }, 100); // 100ms debounce
+    };
+
+    // Create observer
+    observer = new MutationObserver((mutations) => {
+      // Quick check: if button already exists, disconnect
+      if (document.getElementById("tel-bulk-download-floating")) {
+        cleanup("button already exists");
+        return;
+      }
+
+      // Only process if childList mutations (not attributes)
+      const hasRelevantMutation = mutations.some(m => m.type === 'childList' && m.addedNodes.length > 0);
+      if (hasRelevantMutation) {
+        checkAndCreate();
+      }
+    });
+
+    // Start observing with limited scope
+    observer.observe(document.body, {
+      childList: true,
+      subtree: true,
+      attributes: false,
+      characterData: false
+    });
+
+    // Timeout safety: disconnect after 20s and enable fallback
+    timeoutId = setTimeout(() => {
+      if (!document.getElementById("tel-bulk-download-floating")) {
+        logger.warn("MutationObserver timeout - enabling fallback selectors");
+        observerFailed = true;
+        // Try one more time with fallback selectors
+        addBulkDownloadButton();
+      }
+      cleanup("timeout");
+    }, CONFIG.OBSERVER_TIMEOUT_MS);
+
+    // Immediately check in case chat is already loaded
+    checkAndCreate();
+  };
+
   logger.info("Initialized");
+
+  // ===== BULK BUTTON INITIALIZATION =====
+  // Immediately try to add button, then set up observer for SPA navigation
+  (() => {
+    // Try immediately in case chat is already loaded
+    addBulkDownloadButton();
+
+    // Set up observer for SPA navigation (chat loads asynchronously)
+    if (document.readyState === 'complete') {
+      initBulkButtonObserver();
+    } else {
+      window.addEventListener('load', () => {
+        initBulkButtonObserver();
+      }, { once: true });
+    }
+
+    // Also re-check on popstate (back/forward navigation)
+    window.addEventListener('popstate', () => {
+      setTimeout(() => {
+        addBulkDownloadButton();
+      }, 500);
+    });
+  })();
 
   // Debug helper: expose function to inspect message structure
   window.tel_debug_inspect_message = () => {
